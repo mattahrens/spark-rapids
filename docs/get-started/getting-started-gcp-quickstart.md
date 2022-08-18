@@ -30,7 +30,6 @@ rapids-spark-qualification --cluster <cluster-name>
 The output will include information per app about the estimated speed-up and cost savings by migrating
 to the Spark RAPIDS accelerator on GPU.  Additionally, a recommended GPU cluster will be generated.
 
-```bash
 <pre>
 The following applications will benefit from running on the GPU:
 <b>Application Name</b>          <b>Estimated Cost Savings</b>          <b>Estimated GPU Speedup</b>
