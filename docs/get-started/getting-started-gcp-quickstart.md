@@ -21,7 +21,7 @@ application to GPU.
 
 Prerequisites:
 * [GCP Cloud Shell](https://cloud.google.com/shell) or [gcloud CLI](https://cloud.google.com/sdk/docs/install)
-* [Spark Qualification tool](https://pypi.org/project/rapids-spark-qualification)
+* [Spark RAPIDS tools](https://pypi.org/project/rapids-spark-tools)
 
 After your job completes on your Dataproc cluster, run the following command to see the Spark RAPIDS
 qualification output:
@@ -76,6 +76,10 @@ The `spark-rapids.sh` initialization script will install the latest Spark RAPIDS
 
 
 ## Tune GPU workload On Dataproc With Spark RAPIDS
+
+Prerequisites:
+* [GCP Cloud Shell](https://cloud.google.com/shell) or [gcloud CLI](https://cloud.google.com/sdk/docs/install)
+* [Spark RAPIDS tools](https://pypi.org/project/rapids-spark-tools)
 
 After you have run your Spark application on Dataproc with Spark RAPIDS, you can run the Spark RAPIDS profiling tool to analyze your job and see recommended configuration updates based on your workload:
 ```bash
