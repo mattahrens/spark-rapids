@@ -10,6 +10,7 @@ parent: Getting-Started
  Spark and Hadoop service.  This guide will walk through the steps to:
 
 * [Qualify Existing CPU workloads On Dataproc](#qualify-existing-cpu-workloads-on-dataproc)
+* [Set Up GPU Cluster On Dataproc With Spark RAPIDS](#set-up-gpu-cluster-on-dataproc-with-spark-rapids)
 
 ## Qualify Existing CPU Workloads On Dataproc
 
@@ -42,5 +43,34 @@ NDS - query93             <span style="color:green">50.86%</span>               
 --worker-machine-type n1-standard-32
 </pre>
 
+## Set Up GPU Cluster On Dataproc With Spark RAPIDS
 
+Create a Dataproc cluster using T4s
+- One 16-core master node and 4 32-core worker nodes
+- 2 NVIDIA T4 GPUs for each worker node
+
+```bash
+    export REGION=[Your Preferred GCP Region]
+    export GCS_BUCKET=[Your GCS Bucket]
+    export CLUSTER_NAME=[Your Cluster Name]
+    export NUM_GPUS=2
+    export NUM_WORKERS=4
+
+gcloud dataproc clusters create $CLUSTER_NAME  \
+    --region=$REGION \
+    --image-version=2.0-ubuntu18 \
+    --master-machine-type=n1-standard-16 \
+    --num-workers=$NUM_WORKERS \
+    --worker-accelerator=type=nvidia-tesla-t4,count=$NUM_GPUS \
+    --worker-machine-type=n1-highmem-32\
+    --num-worker-local-ssds=4 \
+    --initialization-actions=gs://goog-dataproc-initialization-actions-${REGION}/gpu/install_gpu_driver.sh,gs://goog-dataproc-initialization-actions-${REGION}/rapids/spark-rapids.sh \
+    --optional-components=JUPYTER,ZEPPELIN \
+    --metadata=rapids-runtime=SPARK \
+    --bucket=$GCS_BUCKET \
+    --enable-component-gateway
 ```
+
+The `spark-rapids.sh` initialization script will install the latest Spark RAPIDS jar and configure the proper default settings based on the cluster shape.  Default settings are stored at `/usr/lib/spark/conf/spark-defaults.conf`.
+
+
