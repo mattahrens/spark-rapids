@@ -11,6 +11,7 @@ parent: Getting-Started
 
 * [Qualify Existing CPU workloads On Dataproc](#qualify-existing-cpu-workloads-on-dataproc)
 * [Set Up GPU Cluster On Dataproc With Spark RAPIDS](#set-up-gpu-cluster-on-dataproc-with-spark-rapids)
+* [Tune GPU workload On Dataproc With Spark RAPIDS](#tune-gpu-workload-on-dataproc-with-spark-rapids)
 
 ## Qualify Existing CPU Workloads On Dataproc
 
@@ -34,7 +35,7 @@ to the Spark RAPIDS accelerator on GPU.  Additionally, a recommended GPU cluster
 <pre>
 The following applications will benefit from running on the GPU:
 <b>Application Name</b>          <b>Estimated Cost Savings</b>          <b>Estimated GPU Speedup</b>
-NDS - query93             <span style="color:green">50.86%</span>                          <span style="color:green">2.35x</span>
+Customer analysis app             <span style="color:green">50.86%</span>                          <span style="color:green">2.35x</span>
 <p>
 <b>Recommended GPU cluster</b>
 --master-machine-type n1-standard-16
@@ -50,11 +51,11 @@ Create a Dataproc cluster using T4s
 - 2 NVIDIA T4 GPUs for each worker node
 
 ```bash
-    export REGION=[Your Preferred GCP Region]
-    export GCS_BUCKET=[Your GCS Bucket]
-    export CLUSTER_NAME=[Your Cluster Name]
-    export NUM_GPUS=2
-    export NUM_WORKERS=4
+export REGION=[Your Preferred GCP Region]
+export GCS_BUCKET=[Your GCS Bucket]
+export CLUSTER_NAME=[Your Cluster Name]
+export NUM_GPUS=2
+export NUM_WORKERS=4
 
 gcloud dataproc clusters create $CLUSTER_NAME  \
     --region=$REGION \
@@ -74,3 +75,24 @@ gcloud dataproc clusters create $CLUSTER_NAME  \
 The `spark-rapids.sh` initialization script will install the latest Spark RAPIDS jar and configure the proper default settings based on the cluster shape.  Default settings are stored at `/usr/lib/spark/conf/spark-defaults.conf`.
 
 
+## Tune GPU workload On Dataproc With Spark RAPIDS
+
+After you have run your Spark application on Dataproc with Spark RAPIDS, you can run the Spark RAPIDS profiling tool to analyze your job and see recommended configuration updates based on your workload:
+```bash
+rapids-spark-profiler --cluster <cluster-name>
+```
+
+The output will include information per app about the recommended configuration settings to update.
+
+<pre>
+The following applications will benefit from tuning:
+<b>Application Name</b>
+Customer analysis app
+
+<b>Recommended config setting updates</b>
+spark.sql.shuffle.partitions=320
+spark.sql.files.maxPartitionBytes=2g
+spark.rapids.memory.pinnedPool.size=2g
+spark.executor.memoryOverhead=8.40g
+spark.driver.memory=30g
+</pre>
