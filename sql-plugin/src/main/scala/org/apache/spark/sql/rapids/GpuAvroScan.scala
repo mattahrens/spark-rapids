@@ -977,7 +977,7 @@ class GpuMultiFileAvroPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)] =
+      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] =
     new AvroCopyBlocksRunner(tc, file, outhmb, blocks, offset, batchContext)
 
   // The runner to copy blocks to offset of HostMemoryBuffer
@@ -987,11 +987,11 @@ class GpuMultiFileAvroPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext) extends Callable[(Seq[DataBlockBase], Long)] {
+      batchContext: BatchContext) extends Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] {
 
     private val headerSync = Some(batchContext.mergedHeader.sync)
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def call(): (Seq[DataBlockBase], Long, ScanFsMetricsOutput) = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         val startBytesRead = fileSystemBytesRead()
@@ -1003,7 +1003,7 @@ class GpuMultiFileAvroPartitionReader(
           }
         }
         val bytesRead = fileSystemBytesRead() - startBytesRead
-        (res, bytesRead)
+        (res, bytesRead, null)
       } finally {
         TrampolineUtil.unsetTaskContext()
       }

@@ -2536,9 +2536,9 @@ class MultiFileOrcPartitionReader(
       outhmb: HostMemoryBuffer,
       stripes: ArrayBuffer[DataBlockBase],
       offset: Long)
-    extends Callable[(Seq[DataBlockBase], Long)] {
+    extends Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] {
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def call(): (Seq[DataBlockBase], Long, ScanFsMetricsOutput) = {
       TrampolineUtil.setTaskContext(taskContext)
       try {
         doRead()
@@ -2547,7 +2547,7 @@ class MultiFileOrcPartitionReader(
       }
     }
 
-    private def doRead(): (Seq[DataBlockBase], Long) = {
+    private def doRead(): (Seq[DataBlockBase], Long, ScanFsMetricsOutput) = {
       val startBytesRead = fileSystemBytesRead()
       // copy stripes to the HostMemoryBuffer
       withResource(outhmb) { _ =>
@@ -2571,7 +2571,7 @@ class MultiFileOrcPartitionReader(
       }
       val bytesRead = fileSystemBytesRead() - startBytesRead
       // the stripes returned has been updated, eg, stripe offset, stripe footer length
-      (stripes.toSeq, bytesRead)
+      (stripes.toSeq, bytesRead, null)
     }
   }
 
@@ -2652,7 +2652,7 @@ class MultiFileOrcPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)] = {
+      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] = {
     new OrcCopyStripesRunner(tc, file, outhmb, blocks, offset)
   }
 
