@@ -28,7 +28,7 @@ import scala.language.implicitConversions
 
 import ai.rapids.cudf.{HostMemoryBuffer, NvtxColor, NvtxRange, Table}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
-import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, FILTER_TIME}
+import com.nvidia.spark.rapids.GpuMetric.{BUFFER_TIME, FILTER_TIME, READ_FS_TIME, WRITE_BUFFER_TIME}
 import com.nvidia.spark.rapids.RapidsPluginImplicits.AutoCloseableProducingSeq
 import com.nvidia.spark.rapids.jni.SplitAndRetryOOM
 import org.apache.commons.io.IOUtils
@@ -55,7 +55,7 @@ import org.apache.spark.util.SerializableConfiguration
  * for combining the buffers before sending to GPU.
  */
 case class SingleHMBAndMeta(hmb: HostMemoryBuffer, bytes: Long, numRows: Long,
-    blockMeta: Seq[DataBlockBase])
+    blockMeta: Seq[DataBlockBase], scanFsTaskMetrics: Option[ScanFsMetricsOutput] = None)
 
 object SingleHMBAndMeta {
   // Contains no data but could have number of rows for things like count().
@@ -82,6 +82,9 @@ trait HostMemoryBuffersWithMetaDataBase {
   // Time spent on buffering
   private var _bufferTime: Long = 0L
 
+  // Scan FS metrics
+  def scanFsTaskMetrics: ScanFsMetricsOutput = null
+
   // The partition values which are needed if combining host memory buffers
   // after read by the multithreaded reader but before sending to GPU.
   def allPartValues: Option[Array[(Long, InternalRow)]] = None
@@ -104,6 +107,27 @@ trait HostMemoryBuffersWithMetaDataBase {
   def getFilterTimePct: Double = {
     val totalTime = _filterTime + _bufferTime
     _filterTime.toDouble / totalTime
+  }
+}
+
+// Metrics class for readFsTime and writeBufferTime
+case class ScanFsMetricsOutput(var readFsTime: Long, var writeBufferTime: Long) {
+  private var _totalTime: Long = 0L
+
+  def totalTime: Long = {
+    _totalTime
+  }
+    
+  def setTotalTime(totalTime: Long): Unit = {
+    _totalTime = totalTime
+  }
+    
+  def getReadFsTimePct: Double = {
+    readFsTime.toDouble / _totalTime.toDouble
+  }
+    
+  def getWriteBufferTimePct: Double = {
+    writeBufferTime.toDouble / _totalTime.toDouble
   }
 }
 
@@ -663,6 +687,12 @@ abstract class MultiFileCloudPartitionReaderBase(
           metrics.get(BUFFER_TIME).foreach {
             _ += (blockedTime * fileBufsAndMeta.getBufferTimePct).toLong
           }
+          execMetrics.get(READ_FS_TIME).foreach {
+            _ += (blockedTime * fileBufsAndMeta.scanFsTaskMetrics.getReadFsTimePct).toLong
+          }
+          execMetrics.get(WRITE_BUFFER_TIME).foreach {
+            _ += (blockedTime * fileBufsAndMeta.scanFsTaskMetrics.getWriteBufferTimePct).toLong
+          }
 
           TrampolineUtil.incBytesRead(inputMetrics, fileBufsAndMeta.bytesRead)
           // if we replaced the path with Alluxio, set it to the original filesystem file
@@ -731,9 +761,11 @@ abstract class MultiFileCloudPartitionReaderBase(
     isDone = true
     closeCurrentFileHostBuffers()
     batchIter = EmptyGpuColumnarBatchIterator
+    // TODO: set up counters
     tasks.asScala.foreach { task =>
       if (task.isDone()) {
         task.get.memBuffersAndSizes.foreach { hmbInfo =>
+          // TODO: increment counters
           if (hmbInfo.hmb != null) {
             hmbInfo.hmb.close()
           }
@@ -745,6 +777,7 @@ abstract class MultiFileCloudPartitionReaderBase(
         task.cancel(false)
       }
     }
+    // TODO: set metrics
   }
 }
 
@@ -914,7 +947,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)]
+      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)]
 
   /**
    * File format short name used for logging and other things to uniquely identity
@@ -1105,7 +1138,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       blocks.foreach { case (path, block) =>
         filesAndBlocks.getOrElseUpdate(path, new ArrayBuffer[DataBlockBase]) += block
       }
-      val tasks = new java.util.ArrayList[Future[(Seq[DataBlockBase], Long)]]()
+      val tasks = new java.util.ArrayList[Future[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)]]()
 
       val batchContext = createBatchContext(filesAndBlocks, clippedSchema)
       // First, estimate the output file size for the initial allocating.
@@ -1129,11 +1162,20 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             offset += fileBlockSize
           }
 
+          val startTime = System.nanoTime()
+          var (readFsTotalTime, writeBufferTotalTime, totalTaskTime) = (0L, 0L, 0L)
           for (future <- tasks.asScala) {
-            val (blocks, bytesRead) = future.get()
+            val (blocks, bytesRead, scanFsTaskMetrics) = future.get()
+            readFsTotalTime += scanFsTaskMetrics.readFsTime
+            writeBufferTotalTime += scanFsTaskMetrics.writeBufferTime
+            totalTaskTime += scanFsTaskMetrics.totalTime
             allOutputBlocks ++= blocks
             TrampolineUtil.incBytesRead(inputMetrics, bytesRead)
           }
+          val totalTime = System.nanoTime() - startTime
+          execMetrics.get(READ_FS_TIME).foreach(_.add(totalTime * (readFsTotalTime/totalTaskTime)))
+          execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(totalTime * 
+            (writeBufferTotalTime/totalTaskTime)))
 
           // Fourth, calculate the final buffer size
           val finalBufferSize = calculateFinalBlocksOutputSize(offset, allOutputBlocks.toSeq,

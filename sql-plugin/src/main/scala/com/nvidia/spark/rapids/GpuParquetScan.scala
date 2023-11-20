@@ -1440,11 +1440,30 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     org.apache.parquet.format.Util.writeFileMetaData(meta, out)
   }
 
+//  case class ScanFsMetricsOutput(var readFsTime: Long, var writeBufferTime: Long) {
+//    private var _totalTime: Long = 0L
+//
+//    def totalTime: Long = {
+//      _totalTime
+//    }
+//    def setTotalTime(totalTime: Long): Unit = {
+//      _totalTime = totalTime
+//    }
+//    
+//    def getReadFsTimePct: Double = {
+//      readFsTime.toDouble / _totalTime.toDouble
+//    }
+//    
+//    def getWriteBufferTimePct: Double = {
+//      writeBufferTime.toDouble / _totalTime.toDouble
+//    }
+//  }
+
   protected def copyDataRange(
       range: CopyRange,
       in: FSDataInputStream,
       out: HostMemoryOutputStream,
-      copyBuffer: Array[Byte]): Long = {
+      copyBuffer: Array[Byte]): ScanFsMetricsOutput = {
     var readTime = 0L
     var writeTime = 0L
     if (in.getPos != range.offset) {
@@ -1464,9 +1483,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       writeTime += (end - mid)
       bytesLeft -= readLength
     }
-    execMetrics.get(READ_FS_TIME).foreach(_.add(readTime))
-    execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(writeTime))
-    range.length
+    ScanFsMetricsOutput(readTime, writeTime)
   }
 
   /**
@@ -1535,7 +1552,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       out: HostMemoryOutputStream,
       blocks: Seq[BlockMetaData],
       realStartOffset: Long,
-      metrics: Map[String, GpuMetric]): Seq[BlockMetaData] = {
+      metrics: Map[String, GpuMetric]): (Seq[BlockMetaData], ScanFsMetricsOutput) = {
     val startPos = out.getPos
     val filePathString: String = filePath.toString
     val remoteItems = new ArrayBuffer[CopyRange](blocks.length)
@@ -1561,11 +1578,11 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         localItem.close()
       }
     }
-    copyRemoteBlocksData(remoteItems.toSeq, filePath,
+    val scanFsTaskMetrics = copyRemoteBlocksData(remoteItems.toSeq, filePath,
       filePathString, out, metrics)
     // fixup output pos after blocks were copied possibly out of order
     out.seek(startPos + totalBytesToCopy)
-    computeBlockMetaData(blocks, realStartOffset)
+    (computeBlockMetaData(blocks, realStartOffset), scanFsTaskMetrics)
   }
 
   private def copyRemoteBlocksData(
@@ -1573,17 +1590,17 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       filePath: Path,
       filePathString: String,
       out: HostMemoryOutputStream,
-      metrics: Map[String, GpuMetric]): Long = {
-    var totalBytesCopied = 0L
-    if (remoteCopies.isEmpty) {
-      return totalBytesCopied
-    }
+      metrics: Map[String, GpuMetric]): ScanFsMetricsOutput = {
+    val scanFsMetricsTotals = ScanFsMetricsOutput(0L, 0L)
     val fileHadoopConf = ReaderUtils.getHadoopConfForReaderThread(filePath, conf)
     val coalescedRanges = coalesceReads(remoteCopies)
     val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
     withResource(filePath.getFileSystem(fileHadoopConf).open(filePath)) { in =>
       coalescedRanges.foreach { blockCopy =>
-        totalBytesCopied += copyDataRange(blockCopy, in, out, copyBuffer)
+        val ScanFsMetricsOutput(readFsTime, writeBufferTime) =
+          copyDataRange(blockCopy, in, out, copyBuffer)
+        scanFsMetricsTotals.readFsTime += readFsTime //scanFsMetricsOutput.readFsTime
+        scanFsMetricsTotals.writeBufferTime += writeBufferTime //scanFsMetricsOutput.writeBufferTime
       }
     }
     // try to cache the remote ranges that were copied
@@ -1598,7 +1615,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         token.complete(out.buffer.slice(range.outputOffset, range.length))
       }
     }
-    totalBytesCopied
+    scanFsMetricsTotals
   }
 
   private def coalesceReads(ranges: Seq[CopyRange]): Seq[CopyRange] = {
@@ -1648,13 +1665,14 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   protected def readPartFile(
       blocks: Seq[BlockMetaData],
       clippedSchema: MessageType,
-      filePath: Path): (HostMemoryBuffer, Long, Seq[BlockMetaData]) = {
+      filePath: Path): (HostMemoryBuffer, Long, Seq[BlockMetaData], ScanFsMetricsOutput) = {
     withResource(new NvtxRange("Parquet buffer file split", NvtxColor.YELLOW)) { _ =>
       val estTotalSize = calculateParquetOutputSize(blocks, clippedSchema, false)
       closeOnExcept(HostMemoryBuffer.allocate(estTotalSize)) { hmb =>
         val out = new HostMemoryOutputStream(hmb)
         out.write(ParquetPartitionReader.PARQUET_MAGIC)
-        val outputBlocks = copyBlocksData(filePath, out, blocks, out.getPos, metrics)
+        val (outputBlocks, scanFsTaskMetrics) =
+          copyBlocksData(filePath, out, blocks, out.getPos, metrics)
         val footerPos = out.getPos
         writeFooter(out, outputBlocks, clippedSchema)
         BytesUtils.writeIntLittleEndian(out, (out.getPos - footerPos).toInt)
@@ -1664,7 +1682,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
           throw new QueryExecutionException(s"Calculated buffer size $estTotalSize is to " +
               s"small, actual written: ${out.getPos}")
         }
-        (hmb, out.getPos, outputBlocks)
+        (hmb, out.getPos, outputBlocks, scanFsTaskMetrics)
       }
     }
   }
@@ -1883,23 +1901,27 @@ class MultiFileParquetPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long)
-    extends Callable[(Seq[DataBlockBase], Long)] {
+    extends Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] {
 
-    override def call(): (Seq[DataBlockBase], Long) = {
+    override def call(): (Seq[DataBlockBase], Long, ScanFsMetricsOutput) = {
+      val startTime = System.currentTimeMillis()
       TrampolineUtil.setTaskContext(taskContext)
       try {
         val startBytesRead = fileSystemBytesRead()
-        val outputBlocks = withResource(outhmb) { _ =>
+        val (outputBlocks, scanFsTaskMetrics) = withResource(outhmb) { _ =>
           withResource(new HostMemoryOutputStream(outhmb)) { out =>
             copyBlocksData(file, out, blocks.toSeq, offset, metrics)
           }
         }
         val bytesRead = fileSystemBytesRead() - startBytesRead
-        (outputBlocks, bytesRead)
+        val endTime = System.currentTimeMillis()
+        val totalTime = endTime - startTime
+        scanFsTaskMetrics.setTotalTime(totalTime)
+        (outputBlocks, bytesRead, scanFsTaskMetrics)
       } catch {
         case e: FileNotFoundException if ignoreMissingFiles =>
           logWarning(s"Skipped missing file: ${file.toString}", e)
-          (Seq.empty, 0)
+          (Seq.empty, 0, null)
         // Throw FileNotFoundException even if `ignoreCorruptFiles` is true
         case e: FileNotFoundException if !ignoreMissingFiles => throw e
         case e @ (_: RuntimeException | _: IOException) if ignoreCorruptFiles =>
@@ -1907,7 +1929,7 @@ class MultiFileParquetPartitionReader(
             s"Skipped the rest of the content in the corrupted file: ${file.toString}", e)
           // It leave the empty hole for the re-composed parquet file if we skip
           // the corrupted file. But it should be ok since there is no meta pointing to that "hole"
-          (Seq.empty, 0)
+          (Seq.empty, 0, null)
       } finally {
         TrampolineUtil.unsetTaskContext()
       }
@@ -1942,7 +1964,7 @@ class MultiFileParquetPartitionReader(
       outhmb: HostMemoryBuffer,
       blocks: ArrayBuffer[DataBlockBase],
       offset: Long,
-      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long)] = {
+      batchContext: BatchContext): Callable[(Seq[DataBlockBase], Long, ScanFsMetricsOutput)] = {
     new ParquetCopyBlocksRunner(taskContext, file, outhmb, blocks, offset)
   }
 
@@ -2408,11 +2430,11 @@ class MultiFileCloudParquetPartitionReader(
               while (blockChunkIter.hasNext) {
                 val blocksToRead = populateCurrentBlockChunk(blockChunkIter,
                   maxReadBatchSizeRows, maxReadBatchSizeBytes, fileBlockMeta.readSchema)
-                val (dataBuffer, dataSize, blockMeta) =
+                val (dataBuffer, dataSize, blockMeta, scanFsTaskMetrics) =
                   readPartFile(blocksToRead, fileBlockMeta.schema, filePath)
                 val numRows = blocksToRead.map(_.getRowCount).sum.toInt
                 hostBuffers += SingleHMBAndMeta(dataBuffer, dataSize,
-                  numRows, blockMeta)
+                  numRows, blockMeta, Some(scanFsTaskMetrics))
               }
               val bytesRead = fileSystemBytesRead() - startingBytesRead
               if (isDone) {
@@ -2768,6 +2790,19 @@ class ParquetPartitionReader(
     batchIter.hasNext
   }
 
+  override protected def copyDataRange(
+      range: CopyRange,
+      in: FSDataInputStream,
+      out: HostMemoryOutputStream,
+      copyBuffer: Array[Byte]): ScanFsMetricsOutput = {
+    val scanFsTaskMetrics = super.copyDataRange(range, in, out, copyBuffer)
+    execMetrics.get(READ_FS_TIME).foreach(_.add(scanFsTaskMetrics.readFsTime))
+    execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(scanFsTaskMetrics.writeBufferTime))
+    scanFsTaskMetrics
+  }
+
+  
+
   private def readBatches(): Iterator[ColumnarBatch] = {
     withResource(new NvtxRange("Parquet readBatch", NvtxColor.GREEN)) { _ =>
       val currentChunkedBlocks = populateCurrentBlockChunk(blockIterator,
@@ -2790,7 +2825,8 @@ class ParquetPartitionReader(
           CachedGpuBatchIterator(EmptyTableReader, colTypes)
         } else {
           val parseOpts = getParquetOptions(readDataSchema, clippedParquetSchema, useFieldId)
-          val (dataBuffer, dataSize, _) = metrics(BUFFER_TIME).ns {
+          //val (dataBuffer, dataSize, _, scanFsTaskMetrics) = metrics(BUFFER_TIME).ns {
+          val (dataBuffer, dataSize, _, _) = metrics(BUFFER_TIME).ns {
             readPartFile(currentChunkedBlocks, clippedParquetSchema, filePath)
           }
           if (dataSize == 0) {
